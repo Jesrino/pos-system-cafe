@@ -1,0 +1,19 @@
+{
+  "name": "Juniper & Co. Point of Sale",
+  "short_name": "Juniper POS",
+  "description": "Offline-ready tablet point of sale for Juniper & Co.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#f7f7f2",
+  "theme_color": "#315b43",
+  "icons": [
+    {
+      "src": "/icons/pos-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
