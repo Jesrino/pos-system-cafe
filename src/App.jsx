@@ -5,7 +5,8 @@ import { useNetworkStatus } from './hooks/useNetworkStatus'
 import { useThermalPrinter } from './hooks/useThermalPrinter'
 import { buildEscPosReceipt } from './utils/PosGenerator'
 import { formatCurrency } from './utils/formatters'
-import { syncOfflineOrders } from './api/client'
+import { syncCatalogMutations, syncOfflineOrders } from './api/client'
+import { getCatalogMutations, loadCatalog, removeCatalogMutations, saveProductMutation } from './db/dexieDB'
 
 const PRODUCTS = [
   { id: 'espresso', name: 'Espresso', category: 'Coffee', price: 150, emoji: '☕', color: 'coffee', stock: 18, barcode: '1010001', note: 'Double shot · 2 oz' },
@@ -26,9 +27,30 @@ const CATEGORIES = ['All items', 'Coffee', 'Bakery', 'Brunch', 'Cold drinks']
 const TAX_RATE = 0.0825
 const QUEUE_KEY = 'juniper-pos-queued-orders'
 const HISTORY_KEY = 'juniper-pos-order-history'
+const MANAGER_PIN = '2468'
+const PRODUCT_COLORS = ['coffee', 'latte', 'cream', 'matcha', 'berry', 'pink', 'gold', 'peach', 'sage', 'green', 'honey', 'lemon']
 
 function createOrderId() {
   return `J${Date.now().toString().slice(-7)}`
+}
+
+function createMutationId() {
+  return globalThis.crypto?.randomUUID?.() ?? `catalog-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
+}
+
+function createEmptyProduct() {
+  return {
+    name: '',
+    category: 'Coffee',
+    price: '',
+    stock: '',
+    lowStockThreshold: 5,
+    barcode: '',
+    note: '',
+    emoji: '🛍️',
+    color: PRODUCT_COLORS[Math.floor(Math.random() * PRODUCT_COLORS.length)],
+    modifiers: undefined,
+  }
 }
 
 function readSaved(key) {
@@ -52,6 +74,17 @@ function saveLocal(key, value) {
 function App() {
   const actualOnline = useNetworkStatus()
   const printer = useThermalPrinter()
+  const [products, setProducts] = useState(PRODUCTS)
+  const [catalogMutations, setCatalogMutations] = useState([])
+  const [catalogLoaded, setCatalogLoaded] = useState(false)
+  const [catalogMode, setCatalogMode] = useState(false)
+  const [productForm, setProductForm] = useState(null)
+  const [editingProductId, setEditingProductId] = useState(null)
+  const [priceProduct, setPriceProduct] = useState(null)
+  const [priceDraft, setPriceDraft] = useState('')
+  const [barcodeCaptureMode, setBarcodeCaptureMode] = useState(false)
+  const [pinDraft, setPinDraft] = useState('')
+  const [pinError, setPinError] = useState('')
   const [onlineOverride, setOnlineOverride] = useState(null)
   const isOnline = onlineOverride === null ? actualOnline : onlineOverride
   const [category, setCategory] = useState('All items')
@@ -76,11 +109,12 @@ function App() {
   const syncTimer = useRef(null)
   const toastTimer = useRef(null)
 
-  const filteredProducts = useMemo(() => PRODUCTS.filter((product) => {
+  const categoryNames = useMemo(() => [...new Set([...CATEGORIES.slice(1), ...products.map((product) => product.category)])], [products])
+  const filteredProducts = useMemo(() => products.filter((product) => {
     const matchesCategory = category === 'All items' || product.category === category
     const query = search.trim().toLowerCase()
     return matchesCategory && (!query || product.name.toLowerCase().includes(query) || product.barcode.includes(query))
-  }), [category, search])
+  }), [category, products, search])
 
   const subtotal = cart.reduce((sum, item) => sum + item.unitPrice * item.quantity, 0)
   const discountAmount = subtotal * discount / 100
@@ -96,6 +130,25 @@ function App() {
   }, [])
 
   useEffect(() => {
+    let active = true
+    Promise.all([loadCatalog(PRODUCTS), getCatalogMutations()])
+      .then(([storedProducts, storedMutations]) => {
+        if (!active) return
+        setProducts(storedProducts)
+        setCatalogMutations(storedMutations)
+        setCatalogLoaded(true)
+      })
+      .catch((error) => {
+        console.error('Unable to load the local product catalog.', error)
+        if (active) {
+          setCatalogLoaded(true)
+          showToast('Local catalog unavailable · using sample items for this session')
+        }
+      })
+    return () => { active = false }
+  }, [showToast])
+
+  useEffect(() => {
     saveLocal(QUEUE_KEY, queuedOrders)
   }, [queuedOrders])
 
@@ -104,15 +157,21 @@ function App() {
   }, [orderHistory])
 
   useEffect(() => {
-    if (!isOnline || queuedOrders.length === 0 || syncing) return undefined
+    if (!isOnline || (queuedOrders.length === 0 && catalogMutations.length === 0) || syncing) return undefined
     const syncOrders = () => {
       setSyncing(true)
-      syncOfflineOrders(queuedOrders)
-        .then((result) => {
-          const synced = new Set(result.syncedOrderIds)
-          setQueuedOrders((current) => current.filter((order) => !synced.has(order.id)))
-          setLastSynced(new Date(result.syncedAt))
-          showToast('Offline orders synced successfully')
+      Promise.all([
+        queuedOrders.length ? syncOfflineOrders(queuedOrders) : Promise.resolve({ syncedOrderIds: [], syncedAt: new Date().toISOString() }),
+        catalogMutations.length ? syncCatalogMutations(catalogMutations) : Promise.resolve({ syncedMutationIds: [], syncedAt: new Date().toISOString() }),
+      ])
+        .then(async ([ordersResult, mutationsResult]) => {
+          const syncedOrders = new Set(ordersResult.syncedOrderIds)
+          const syncedMutations = new Set(mutationsResult.syncedMutationIds)
+          await removeCatalogMutations([...syncedMutations])
+          setQueuedOrders((current) => current.filter((order) => !syncedOrders.has(order.id)))
+          setCatalogMutations((current) => current.filter((mutation) => !syncedMutations.has(mutation.id)))
+          setLastSynced(new Date(mutationsResult.syncedAt))
+          showToast(`Synced ${syncedOrders.size} order${syncedOrders.size === 1 ? '' : 's'} and ${syncedMutations.size} catalog update${syncedMutations.size === 1 ? '' : 's'}`)
         })
         .catch((error) => {
           console.error('Offline order sync failed.', error)
@@ -122,10 +181,14 @@ function App() {
     }
     syncTimer.current = window.setTimeout(syncOrders, 350)
     return () => window.clearTimeout(syncTimer.current)
-  }, [isOnline, queuedOrders, showToast, syncing])
+  }, [catalogMutations, isOnline, queuedOrders, showToast, syncing])
 
   useEffect(() => {
     const handleSearchShortcut = (event) => {
+      if (event.key === 'Escape' && barcodeCaptureMode) {
+        setBarcodeCaptureMode(false)
+        showToast('Barcode scan cancelled')
+      }
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
         event.preventDefault()
         searchInputRef.current?.focus()
@@ -133,12 +196,29 @@ function App() {
     }
     window.addEventListener('keydown', handleSearchShortcut)
     return () => window.removeEventListener('keydown', handleSearchShortcut)
-  }, [])
+  }, [barcodeCaptureMode, showToast])
 
   useEffect(() => () => {
     window.clearTimeout(syncTimer.current)
     window.clearTimeout(toastTimer.current)
   }, [])
+
+  const commitProduct = async (product, operation) => {
+    const mutation = {
+      id: createMutationId(),
+      type: operation,
+      product: { ...product },
+      createdAt: new Date().toISOString(),
+    }
+    await saveProductMutation(product, mutation)
+    setProducts((current) => {
+      const exists = current.some((item) => item.id === product.id)
+      return exists
+        ? current.map((item) => item.id === product.id ? product : item)
+        : [...current, product]
+    })
+    setCatalogMutations((current) => [...current, mutation])
+  }
 
   const addProduct = useCallback((product, choices = {}) => {
     const modifiers = Object.entries(choices).filter(([, value]) => value).map(([name, value]) => `${name}: ${value}`)
@@ -156,6 +236,7 @@ function App() {
   }, [showToast])
 
   const handleProductClick = (product) => {
+    if (catalogMode) return openProductEditor(product)
     if (product.stock === 0) return showToast(`${product.name} is out of stock`)
     if (!product.modifiers) return addProduct(product)
     const defaults = Object.fromEntries(Object.entries(product.modifiers).map(([name, options]) => [name, options[0]]))
@@ -165,11 +246,29 @@ function App() {
   }
 
   const scanBarcode = useCallback((barcode) => {
-    const product = PRODUCTS.find((item) => item.barcode === barcode)
+    if (barcodeCaptureMode) {
+      const duplicate = products.find((product) => product.barcode === barcode && product.id !== editingProductId)
+      if (duplicate) {
+        showToast(`Barcode already belongs to ${duplicate.name}`)
+        return
+      }
+      setProductForm((current) => current ? { ...current, barcode } : current)
+      setBarcodeCaptureMode(false)
+      showToast(`Barcode ${barcode} added to product`)
+      return
+    }
+
+    const product = products.find((item) => item.barcode === barcode)
     if (!product) return showToast(`No product found for ${barcode}`)
+    if (catalogMode) {
+      setEditingProductId(product.id)
+      setProductForm({ ...product, price: String(product.price), stock: String(product.stock) })
+      setModal('product')
+      return
+    }
     addProduct(product)
-  }, [addProduct, showToast])
-  useBarcodeScanner(scanBarcode)
+  }, [addProduct, barcodeCaptureMode, catalogMode, editingProductId, products, showToast])
+  useBarcodeScanner(scanBarcode, () => barcodeCaptureMode)
 
   const changeQuantity = (key, amount) => {
     setCart((current) => current.map((item) => item.key === key ? { ...item, quantity: item.quantity + amount } : item).filter((item) => item.quantity > 0))
@@ -186,7 +285,7 @@ function App() {
     setModal('checkout')
   }
 
-  const finalizeOrder = (payments) => {
+  const finalizeOrder = async (payments) => {
     const order = {
       id: createOrderId(),
       createdAt: new Date().toISOString(),
@@ -204,19 +303,34 @@ function App() {
     setCart([])
     setDiscount(0)
     setModal('receipt')
+
+    const quantityByProduct = new Map()
+    cart.forEach((item) => quantityByProduct.set(item.productId, (quantityByProduct.get(item.productId) ?? 0) + item.quantity))
+    const inventoryUpdates = [...quantityByProduct.entries()].map(async ([productId, quantity]) => {
+      const product = products.find((item) => item.id === productId)
+      if (!product) return
+      const updatedProduct = { ...product, stock: Math.max(0, product.stock - quantity) }
+      try {
+        await commitProduct(updatedProduct, 'UPDATE_PRODUCT')
+      } catch (error) {
+        console.error('Unable to persist inventory after the sale.', error)
+        showToast(`Sale completed; ${product.name} inventory could not be saved`)
+      }
+    })
+    await Promise.all(inventoryUpdates)
   }
 
   const payCash = () => {
     const tendered = Number(cashTendered)
     if (!Number.isFinite(tendered) || tendered < total) return showToast('Cash received must cover the total')
-    finalizeOrder([{ method: 'Cash', amount: total, tendered, change: tendered - total }])
+    void finalizeOrder([{ method: 'Cash', amount: total, tendered, change: tendered - total }])
   }
 
   const paySplit = () => {
     const cash = Number(splitCash) || 0
     const card = Number(splitCard) || 0
     if (cash < 0 || card < 0 || Math.abs(cash + card - total) > 0.01) return showToast('Split amounts must add up to the total')
-    finalizeOrder([{ method: 'Cash', amount: cash }, { method: 'Card', amount: card }])
+    void finalizeOrder([{ method: 'Cash', amount: cash }, { method: 'Card', amount: card }])
   }
 
   const payCard = () => {
@@ -224,7 +338,7 @@ function App() {
     window.setTimeout(() => setCardStatus('processing'), 850)
     window.setTimeout(() => {
       setCardStatus('approved')
-      window.setTimeout(() => finalizeOrder([{ method: 'Card', amount: total }]), 650)
+      window.setTimeout(() => { void finalizeOrder([{ method: 'Card', amount: total }]) }, 650)
     }, 1850)
   }
 
@@ -274,6 +388,122 @@ function App() {
     }
   }
 
+  const requestCatalogAccess = () => {
+    if (catalogMode) {
+      setCatalogMode(false)
+      showToast('Catalog editing turned off')
+      return
+    }
+    setPinDraft('')
+    setPinError('')
+    setModal('pin')
+  }
+
+  const verifyManagerPin = (event) => {
+    event.preventDefault()
+    if (pinDraft !== MANAGER_PIN) {
+      setPinError('That PIN didn’t match. Try again.')
+      return
+    }
+    setCatalogMode(true)
+    setModal(null)
+    showToast('Catalog edit mode enabled')
+  }
+
+  const openNewProduct = () => {
+    setEditingProductId(null)
+    setProductForm(createEmptyProduct())
+    setBarcodeCaptureMode(false)
+    setModal('product')
+  }
+
+  const openProductEditor = (product) => {
+    setEditingProductId(product.id)
+    setProductForm({
+      ...product,
+      price: String(product.price),
+      stock: String(product.stock),
+      lowStockThreshold: product.lowStockThreshold ?? 5,
+    })
+    setBarcodeCaptureMode(false)
+    setModal('product')
+  }
+
+  const saveProductForm = async (event) => {
+    event.preventDefault()
+    const name = productForm.name.trim()
+    const productCategory = productForm.category.trim()
+    const price = Number(productForm.price)
+    const stock = Number(productForm.stock)
+    const lowStockThreshold = Number(productForm.lowStockThreshold)
+    if (!name || !productCategory || !Number.isFinite(price) || price <= 0 || !Number.isInteger(stock) || stock < 0 || !Number.isInteger(lowStockThreshold) || lowStockThreshold < 0) {
+      showToast('Enter a name, category, valid price, and whole-number inventory values')
+      return
+    }
+    const barcode = productForm.barcode.trim()
+    const duplicate = products.find((product) => product.barcode === barcode && product.id !== editingProductId)
+    if (barcode && duplicate) {
+      showToast(`Barcode already belongs to ${duplicate.name}`)
+      return
+    }
+    const product = {
+      ...productForm,
+      id: editingProductId ?? `${name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'item'}-${createMutationId().slice(-6)}`,
+      name,
+      category: productCategory,
+      price,
+      stock,
+      lowStockThreshold,
+      barcode,
+      note: productForm.note.trim(),
+      modifiers: editingProductId ? productForm.modifiers : undefined,
+    }
+    try {
+      await commitProduct(product, editingProductId ? 'UPDATE_PRODUCT' : 'CREATE_PRODUCT')
+      setCategory('All items')
+      setSearch('')
+      setBarcodeCaptureMode(false)
+      setModal(null)
+      showToast(editingProductId ? `${name} updated` : `${name} added to catalog`)
+    } catch (error) {
+      console.error('Unable to save the product catalog change.', error)
+      showToast('Could not save product to local storage')
+    }
+  }
+
+  const saveInlinePrice = async () => {
+    const price = Number(priceDraft)
+    if (!Number.isFinite(price) || price <= 0) {
+      showToast('Enter a price greater than ₱0')
+      return
+    }
+    try {
+      await commitProduct({ ...priceProduct, price }, 'UPDATE_PRODUCT')
+      showToast(`${priceProduct.name} price updated`)
+      setModal(null)
+      setPriceProduct(null)
+    } catch (error) {
+      console.error('Unable to save the inline product price.', error)
+      showToast('Could not save price to local storage')
+    }
+  }
+
+  const updatePriceKeypad = (key) => {
+    if (key === 'clear') {
+      setPriceDraft('')
+      return
+    }
+    if (key === 'backspace') {
+      setPriceDraft((current) => current.slice(0, -1))
+      return
+    }
+    setPriceDraft((current) => {
+      if (key === '.' && current.includes('.')) return current
+      if (current.includes('.') && current.split('.')[1].length >= 2) return current
+      return `${current}${key}`
+    })
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -287,14 +517,17 @@ function App() {
           <span className="open-pill"><i /> OPEN</span>
         </div>
         <div className="topbar-actions">
+          <button className={`catalog-mode-toggle ${catalogMode ? 'active' : ''}`} onClick={requestCatalogAccess}>
+            <span>{catalogMode ? '✎' : '▦'}</span>{catalogMode ? 'Done editing' : 'Edit catalog'}
+          </button>
           <button className="shift-button" onClick={() => setModal('report')}><span>▤</span> Shift report</button>
           <div className="header-divider" />
           <button className={`connection-button ${isOnline ? 'is-online' : 'is-offline'}`} onClick={toggleConnection} title="Toggle simulated connection">
             <span className="connection-dot" />
             <span>{isOnline ? 'Online' : 'Offline'}</span>
           </button>
-          <div className={`sync-chip ${queuedOrders.length ? 'has-queue' : ''}`} title={lastSynced ? `Last synced ${lastSynced.toLocaleTimeString()}` : 'Offline order sync queue'}>
-            <span>{syncing ? '↻' : '⇧'}</span>{queuedOrders.length} pending
+          <div className={`sync-chip ${queuedOrders.length + catalogMutations.length ? 'has-queue' : ''}`} title={`${queuedOrders.length} orders · ${catalogMutations.length} catalog updates${lastSynced ? ` · Last synced ${lastSynced.toLocaleTimeString()}` : ''}`}>
+            <span>{syncing ? '↻' : '⇧'}</span>{queuedOrders.length + catalogMutations.length} pending
           </div>
           <div className="hardware-chip"><span className="hardware-icon">▥</span><span>Scanner</span><i /></div>
           <button className="hardware-chip printer-chip" onClick={handlePrinterAction} title={printer.connected ? 'Disconnect thermal printer' : 'Connect USB thermal printer'}><span className="hardware-icon">▤</span><span>{printer.connected ? 'Printer connected' : printer.usbSupported ? 'Connect printer' : 'Print ready'}</span><i /></button>
@@ -313,9 +546,11 @@ function App() {
             <div className="today-stat"><span className="stat-icon">↗</span><span><small>TODAY’S SALES</small><strong>{formatCurrency(orderHistory.reduce((sum, order) => sum + order.total, 0))}</strong></span></div>
           </div>
 
+          {catalogMode && <div className="catalog-mode-banner"><span className="catalog-mode-icon">✎</span><div><strong>Catalog edit mode</strong><small>Tap a price to update it, or edit a product’s details and stock.</small></div><button onClick={openNewProduct}>＋ Add product</button></div>}
+
           <div className="catalog-tools">
             <div className="category-tabs" role="tablist" aria-label="Product categories">
-              {CATEGORIES.map((item) => (
+              {['All items', ...categoryNames].map((item) => (
                 <button key={item} role="tab" aria-selected={category === item} className={`category-tab ${category === item ? 'active' : ''}`} onClick={() => setCategory(item)}>
                   {item === 'All items' ? '✦' : item === 'Coffee' ? '☕' : item === 'Bakery' ? '🥐' : item === 'Brunch' ? '🍳' : '🧋'} <span>{item}</span>
                 </button>
@@ -329,9 +564,10 @@ function App() {
             </label>
           </div>
 
-          <div className="menu-label"><span>{category === 'All items' ? 'ALL MENU' : category.toUpperCase()}</span><span>{filteredProducts.length} items <i>·</i> Tap to add</span></div>
+          <div className="menu-label"><span>{category === 'All items' ? 'ALL MENU' : category.toUpperCase()}</span><span>{filteredProducts.length} items <i>·</i> {catalogMode ? 'Catalog editing' : 'Tap to add'}</span></div>
           <div className="product-grid">
-            {filteredProducts.map((product) => <ProductCard key={product.id} product={product} onClick={() => handleProductClick(product)} />)}
+            {filteredProducts.map((product) => <ProductCard key={product.id} product={product} catalogMode={catalogMode} onClick={() => handleProductClick(product)} onEdit={() => openProductEditor(product)} onPriceClick={() => { setPriceProduct(product); setPriceDraft(String(product.price)); setModal('price') }} />)}
+            {catalogMode && <button className="add-product-tile" onClick={openNewProduct}><span>＋</span><strong>Add new item</strong><small>Create a product for your menu</small></button>}
             {filteredProducts.length === 0 && <div className="empty-search"><span>⌕</span><strong>No menu items found</strong><small>Try another search or scan a barcode.</small></div>}
           </div>
           <div className="catalog-footer"><span>♧</span> Freshly made, just for you <i>·</i> Juniper & Co. <span className="footer-shortcut">BARCODE SCANNER READY <b>↵</b></span></div>
@@ -382,6 +618,51 @@ function App() {
       </main>
 
       {toast && <div className="toast" role="status"><span>✓</span>{toast}</div>}
+
+      {modal === 'pin' && (
+        <Modal onClose={closeModal} className="pin-modal">
+          <button className="modal-close" onClick={closeModal} aria-label="Close">×</button>
+          <div className="manager-lock">⌑</div>
+          <div className="modal-heading pin-heading"><div className="eyebrow">MANAGER ACCESS</div><h2>Unlock the catalog</h2><p>Enter your manager PIN to edit products and inventory.</p></div>
+          <form onSubmit={verifyManagerPin}>
+            <label className="form-field"><span>Manager PIN</span><input autoFocus inputMode="numeric" type="password" maxLength={8} value={pinDraft} onChange={(event) => { setPinDraft(event.target.value); setPinError('') }} placeholder="Enter PIN" /></label>
+            {pinError && <p className="form-error">{pinError}</p>}
+            <button className="modal-primary" type="submit">Unlock edit mode <span>→</span></button>
+            <p className="pin-hint">Ask your manager for an authorized PIN.</p>
+          </form>
+        </Modal>
+      )}
+
+      {modal === 'product' && productForm && (
+        <Modal onClose={() => { setBarcodeCaptureMode(false); closeModal() }} className="product-form-modal">
+          <div className="modal-heading checkout-title"><div><div className="eyebrow">{editingProductId ? 'CATALOG · EDIT ITEM' : 'CATALOG · NEW ITEM'}</div><h2>{editingProductId ? 'Edit product' : 'Add a product'}</h2><p>Product details and inventory are saved on this device.</p></div><button className="modal-close" onClick={() => { setBarcodeCaptureMode(false); closeModal() }} aria-label="Close">×</button></div>
+          <form className="product-form" onSubmit={saveProductForm}>
+            <label className="form-field"><span>Product name <b>*</b></span><input autoFocus maxLength={60} value={productForm.name} onChange={(event) => setProductForm((current) => ({ ...current, name: event.target.value }))} placeholder="e.g. Iced vanilla latte" required /></label>
+            <div className="form-row">
+              <label className="form-field"><span>Category <b>*</b></span><input list="product-category-options" value={productForm.category} onChange={(event) => setProductForm((current) => ({ ...current, category: event.target.value }))} placeholder="Choose or type a category" required /><datalist id="product-category-options">{categoryNames.map((name) => <option key={name} value={name} />)}</datalist></label>
+              <label className="form-field"><span>Price (PHP) <b>*</b></span><span className="form-input-prefix">₱<input inputMode="decimal" type="number" min="0.01" step="0.01" value={productForm.price} onChange={(event) => setProductForm((current) => ({ ...current, price: event.target.value }))} placeholder="0.00" required /></span></label>
+            </div>
+            <div className="form-row">
+              <label className="form-field"><span>Stock count <b>*</b></span><input inputMode="numeric" type="number" min="0" step="1" value={productForm.stock} onChange={(event) => setProductForm((current) => ({ ...current, stock: event.target.value }))} placeholder="0" required /></label>
+              <label className="form-field"><span>Low-stock alert at</span><input inputMode="numeric" type="number" min="0" step="1" value={productForm.lowStockThreshold} onChange={(event) => setProductForm((current) => ({ ...current, lowStockThreshold: event.target.value }))} /></label>
+            </div>
+            <label className="form-field"><span>Short description <small>Optional</small></span><input maxLength={80} value={productForm.note ?? ''} onChange={(event) => setProductForm((current) => ({ ...current, note: event.target.value }))} placeholder="A quick note shown on the menu card" /></label>
+            <div className="form-field"><span>Barcode / SKU <small>Optional</small></span><div className="barcode-entry"><input value={productForm.barcode} onChange={(event) => setProductForm((current) => ({ ...current, barcode: event.target.value }))} placeholder="Scan or enter a barcode" /><button type="button" onClick={(event) => { event.currentTarget.blur(); setBarcodeCaptureMode(true); showToast('Ready to scan · scan a barcode now') }}>▥ <span>Scan barcode</span></button></div>{barcodeCaptureMode && <small className="scan-hint">Scanner ready — scan the product barcode. Press Escape to cancel.</small>}</div>
+            <div className="product-form-note"><span>▤</span><span>Inventory changes save locally first and sync when a connection is available.</span></div>
+            <button className="modal-primary" type="submit" disabled={!catalogLoaded}>{editingProductId ? 'Save product changes' : 'Add product to catalog'} <span>→</span></button>
+          </form>
+        </Modal>
+      )}
+
+      {modal === 'price' && priceProduct && (
+        <Modal onClose={closeModal} className="price-keypad-modal">
+          <button className="modal-close" onClick={closeModal} aria-label="Close">×</button>
+          <div className="modal-heading pin-heading"><div className="eyebrow">QUICK PRICE EDIT</div><h2>{priceProduct.name}</h2><p>Set a new price in Philippine pesos.</p></div>
+          <label className="price-display"><span>₱</span><input autoFocus inputMode="decimal" value={priceDraft} onChange={(event) => setPriceDraft(event.target.value.replace(/[^\d.]/g, '').replace(/(\..*)\./g, '$1'))} aria-label="New product price" /></label>
+          <div className="price-keypad">{['1', '2', '3', '4', '5', '6', '7', '8', '9', '.', '0', 'backspace'].map((key) => <button type="button" key={key} onClick={() => updatePriceKeypad(key)}>{key === 'backspace' ? '⌫' : key}</button>)}</div>
+          <div className="price-keypad-actions"><button onClick={() => setPriceDraft('')}>Clear</button><button className="modal-primary" onClick={saveInlinePrice}>Save price <span>→</span></button></div>
+        </Modal>
+      )}
 
       {modal === 'modifier' && modifierProduct && (
         <Modal onClose={closeModal} className="modifier-modal">
@@ -457,13 +738,22 @@ function App() {
   )
 }
 
-function ProductCard({ product, onClick }) {
+function ProductCard({ product, catalogMode, onClick, onEdit, onPriceClick }) {
+  const lowStockThreshold = product.lowStockThreshold ?? 5
+  const lowStock = product.stock <= lowStockThreshold
   return (
-    <button className="product-card" onClick={onClick} aria-label={`Add ${product.name}, ${formatCurrency(product.price)}`}>
-      <div className={`product-art ${product.color}`}><span className="product-emoji">{product.emoji}</span><span className={`stock-badge ${product.stock <= 5 ? 'low-stock' : ''}`}>{product.stock <= 5 ? `Only ${product.stock}` : `${product.stock} left`}</span>{product.modifiers && <span className="modifier-tag">CUSTOMIZE</span>}</div>
-      <div className="product-details"><div><strong>{product.name}</strong><small>{product.note}</small></div><span className="product-price">{formatCurrency(product.price)}</span></div>
-      <span className="add-product">+</span>
-    </button>
+    <article className={`product-card ${catalogMode ? 'catalog-edit-card' : ''}`}>
+      <button className="product-card-main" onClick={onClick} aria-label={catalogMode ? `Edit ${product.name}` : `Add ${product.name}, ${formatCurrency(product.price)}`}>
+        <div className={`product-art ${product.color}`}><span className="product-emoji">{product.emoji}</span><span className={`stock-badge ${lowStock ? 'low-stock' : ''}`}>{lowStock ? `Low · ${product.stock}` : `${product.stock} left`}</span>{product.modifiers && <span className="modifier-tag">CUSTOMIZE</span>}</div>
+        <div className="product-details"><div><strong>{product.name}</strong><small>{product.note || product.category}</small></div></div>
+      </button>
+      {catalogMode
+        ? <button className="product-price-editor" onClick={onPriceClick} aria-label={`Edit ${product.name} price`}>{formatCurrency(product.price)} <span>✎</span></button>
+        : <span className="product-price-display">{formatCurrency(product.price)}</span>}
+      {catalogMode
+        ? <button className="edit-product-button" onClick={onEdit} aria-label={`Edit ${product.name} details`}>✎</button>
+        : <span className="add-product">+</span>}
+    </article>
   )
 }
 
