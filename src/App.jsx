@@ -108,6 +108,8 @@ function App() {
   const [lastSynced, setLastSynced] = useState(null)
   const syncTimer = useRef(null)
   const toastTimer = useRef(null)
+  const syncAttemptSignature = useRef(null)
+  const previousOnlineState = useRef(isOnline)
 
   const categoryNames = useMemo(() => [...new Set([...CATEGORIES.slice(1), ...products.map((product) => product.category)])], [products])
   const filteredProducts = useMemo(() => products.filter((product) => {
@@ -157,8 +159,18 @@ function App() {
   }, [orderHistory])
 
   useEffect(() => {
+    if (previousOnlineState.current !== isOnline) {
+      previousOnlineState.current = isOnline
+      syncAttemptSignature.current = null
+    }
+  }, [isOnline])
+
+  useEffect(() => {
     if (!isOnline || (queuedOrders.length === 0 && catalogMutations.length === 0) || syncing) return undefined
+    const signature = `${queuedOrders.map((order) => order.id).join(',')}|${catalogMutations.map((mutation) => mutation.id).join(',')}`
+    if (syncAttemptSignature.current === signature) return undefined
     const syncOrders = () => {
+      syncAttemptSignature.current = signature
       setSyncing(true)
       Promise.all([
         queuedOrders.length ? syncOfflineOrders(queuedOrders) : Promise.resolve({ syncedOrderIds: [], syncedAt: new Date().toISOString() }),
@@ -171,6 +183,7 @@ function App() {
           setQueuedOrders((current) => current.filter((order) => !syncedOrders.has(order.id)))
           setCatalogMutations((current) => current.filter((mutation) => !syncedMutations.has(mutation.id)))
           setLastSynced(new Date(mutationsResult.syncedAt))
+          syncAttemptSignature.current = null
           showToast(`Synced ${syncedOrders.size} order${syncedOrders.size === 1 ? '' : 's'} and ${syncedMutations.size} catalog update${syncedMutations.size === 1 ? '' : 's'}`)
         })
         .catch((error) => {
@@ -221,6 +234,13 @@ function App() {
   }
 
   const addProduct = useCallback((product, choices = {}) => {
+    const quantityInCart = cart
+      .filter((item) => item.productId === product.id)
+      .reduce((sum, item) => sum + item.quantity, 0)
+    if (quantityInCart >= product.stock) {
+      showToast(`Only ${product.stock} ${product.name} available`)
+      return
+    }
     const modifiers = Object.entries(choices).filter(([, value]) => value).map(([name, value]) => `${name}: ${value}`)
     const extra = modifiers.reduce((amount, modifier) => {
       const match = modifier.match(/\+₱(\d+(?:\.\d+)?)/)
@@ -233,7 +253,7 @@ function App() {
       return [...current, { key, productId: product.id, name: product.name, emoji: product.emoji, quantity: 1, unitPrice: product.price + extra, modifiers }]
     })
     showToast(`${product.name} added to order`)
-  }, [showToast])
+  }, [cart, showToast])
 
   const handleProductClick = (product) => {
     if (catalogMode) return openProductEditor(product)
@@ -586,7 +606,7 @@ function App() {
               <div className="cart-row" key={item.key}>
                 <div className="cart-product-icon">{item.emoji}</div>
                 <div className="cart-item-info"><strong>{item.name}</strong>{item.modifiers.length > 0 && <small>{item.modifiers.join(' · ')}</small>}<button className="remove-item" onClick={() => setCart((current) => current.filter((entry) => entry.key !== item.key))}>Remove</button></div>
-                <div className="quantity-control"><button aria-label={`Remove one ${item.name}`} onClick={() => changeQuantity(item.key, -1)}>−</button><span>{item.quantity}</span><button aria-label={`Add one ${item.name}`} onClick={() => changeQuantity(item.key, 1)}>+</button></div>
+                <div className="quantity-control"><button aria-label={`Remove one ${item.name}`} onClick={() => changeQuantity(item.key, -1)}>−</button><span>{item.quantity}</span><button aria-label={`Add one ${item.name}`} disabled={cart.filter((entry) => entry.productId === item.productId).reduce((sum, entry) => sum + entry.quantity, 0) >= (products.find((product) => product.id === item.productId)?.stock ?? Infinity)} onClick={() => changeQuantity(item.key, 1)}>+</button></div>
                 <strong className="cart-line-total">{formatCurrency(item.unitPrice * item.quantity)}</strong>
               </div>
             ))}
@@ -763,8 +783,8 @@ function Modal({ children, onClose, className = '' }) {
 
 function ChangeBreakdown({ amount }) {
   if (amount <= 0) return null
-  const denominations = [1000, 500, 100, 25, 10, 5, 1]
-  const labels = ['$10', '$5', '$1', '25¢', '10¢', '5¢', '1¢']
+  const denominations = [100000, 50000, 20000, 10000, 5000, 2000, 1000, 500, 200, 100, 50, 25, 10, 5, 1]
+  const labels = ['₱1,000', '₱500', '₱200', '₱100', '₱50', '₱20', '₱10', '₱5', '₱2', '₱1', '50¢', '25¢', '10¢', '5¢', '1¢']
   let remaining = amount
   const change = denominations.map((value) => {
     const count = Math.floor(remaining / value)
